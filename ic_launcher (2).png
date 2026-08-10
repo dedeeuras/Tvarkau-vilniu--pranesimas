@@ -1,442 +1,226 @@
 package lt.pilietis.greitaspranesimas
 
-import android.Manifest
-import android.content.Intent
-import android.net.Uri
-import android.os.Bundle
-import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.unit.dp
-import androidx.core.content.IntentCompat
-import androidx.lifecycle.lifecycleScope
-import coil.compose.AsyncImage
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
- * 0  = tik užpildo, laukia paspaudimo (numatyta, saugiausia)
- * >0 = automatinis siuntimas po N sekundžių su atšaukimo galimybe
+ * Parašyta pagal oficialią OpenAPI 2.0.0 specifikaciją:
+ * https://api-tvarkau.vilnius.lt/docs-v2
  */
-private const val AUTO_SEND_SECONDS = 0
+object TvarkauApi {
 
-class ShareActivity : ComponentActivity() {
+    private const val BASE = "https://api-tvarkau.vilnius.lt/api/v2/"
+    const val VILNIUS = 1
 
-    private lateinit var photoUri: Uri
-    private lateinit var prefs: Prefs
+    private val JSON = "application/json".toMediaType()
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)  // nuotraukos įkėlimas
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
-    private val locationPermission = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { /* atmetus tiesiog liks tik EXIF variantas */ }
+    /** Antraštė user_token. null = teikiama anonimiškai. */
+    var userToken: String? = null
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+    /**
+     * Anoniminio pranešėjo identifikatorius. Turi būti PASTOVUS šiam įrenginiui —
+     * pagal jį vėliau galima rasti savo pranešimus (`GET /problems?serial_number=`)
+     * arba juos susieti su paskyra (`PATCH /user/synchronize`).
+     * Svetainė generuoja naują kaskart, todėl ten ta galimybė prarandama.
+     */
+    var serialNumber: String? = null
 
-        val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-        if (uri == null) {
-            Toast.makeText(this, "Nuotrauka negauta", Toast.LENGTH_SHORT).show()
-            finish(); return
-        }
-        photoUri = uri
-        locationPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+    // ---------- Kategorijos ----------
 
-        prefs = Prefs(this)
-        prefs.applyTo() // user_token + serial_number
+    data class ProblemType(
+        val id: Int,
+        val name: String,
+        val category: String,
+        val onlyRegistered: Boolean,  // onlyRegister=1 -> anonimiškai negalima
+        val needsExtraFields: Boolean, // additionalFields su required
+        val redirectUrl: String?,      // jei yra - teikiama ne čia, o kitoje svetainėje
+        val seasonal: Boolean,
+    ) {
+        val label get() = "$category → $name"
 
-        setContent { AppTheme { ReportScreen() } }
+        /** Ar šį tipą galima pateikti šia programėle dabartinėje būsenoje. */
+        fun submittable(hasToken: Boolean) =
+            redirectUrl.isNullOrBlank() && !needsExtraFields && (hasToken || !onlyRegistered)
     }
 
-    @Composable
-    private fun ReportScreen() {
-        var loading by remember { mutableStateOf(true) }
-        var error by remember { mutableStateOf<String?>(null) }
-        var sending by remember { mutableStateOf(false) }
+    /** Dviejų lygių atsakymas suplokštinamas į vieną sąrašą. */
+    suspend fun problemTypes(cityId: Int = VILNIUS): List<ProblemType> =
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder()
+                .url("${BASE}categories/problem-types?cityId=$cityId")
+                .get().build()
 
-        var meta by remember { mutableStateOf<PhotoMeta?>(null) }
-        var types by remember { mutableStateOf<List<TvarkauApi.ProblemType>>(emptyList()) }
-        var typeId by remember { mutableStateOf<Int?>(null) }
-        var description by remember { mutableStateOf("") }
-        var warning by remember { mutableStateOf<String?>(null) }
-        var countdown by remember { mutableIntStateOf(AUTO_SEND_SECONDS) }
-        var autoCancelled by remember { mutableStateOf(false) }
-        var photoBase64 by remember { mutableStateOf<String?>(null) }
-        // Rankinis vietos ivedimas, kai nera nei EXIF, nei GPS
-        var manualLat by remember { mutableStateOf<Double?>(null) }
-        var manualLng by remember { mutableStateOf<Double?>(null) }
-        var addressQuery by remember { mutableStateOf("") }
-        var geocoding by remember { mutableStateOf(false) }
-        var showConfirm by remember { mutableStateOf(false) }
-        var errorText by remember { mutableStateOf<String?>(null) }
+            http.newCall(req).execute().use { r ->
+                val raw = r.body?.string().orEmpty()
+                if (!r.isSuccessful) error("problem-types ${r.code}: $raw")
+                val cats = JSONObject(raw).getJSONArray("data")
 
-        // ---- paruošimas: metaduomenys + kategorijos + Claude ----
-        LaunchedEffect(Unit) {
-            runCatching {
-                // Autorizacija nebūtina: jei miestas leidžia, teikiama anonimiškai.
-                // Turint žetoną: TvarkauApi.userToken = "..."
+                buildList {
+                    for (i in 0 until cats.length()) {
+                        val cat = cats.getJSONObject(i)
+                        val catName = cat.optString("name")
+                        val types = cat.optJSONArray("problemTypes") ?: continue
 
-                val m = PhotoMetaReader.read(this@ShareActivity, photoUri)
-                val t = TvarkauApi.submittableTypes(TvarkauApi.VILNIUS)
-                meta = m; types = t
-
-                val b64 = PhotoMetaReader.downscaleToBase64(this@ShareActivity, photoUri)
-                    ?: error("Nepavyko perskaityti nuotraukos")
-                photoBase64 = b64 // ta pati kopija keliaus ir į pranešimą
-
-                val s = Vision.analyze(BuildConfig.ANTHROPIC_API_KEY, b64, m.address, t)
-                typeId = s.reportTypeId
-                description = s.description
-                warning = buildString {
-                    s.warning?.let { appendLine(it) }
-                    if (!s.reportable) appendLine("Nuotraukoje neatpažinta miesto problema.")
-                    if (s.confidence < 0.6) appendLine("Kategorija parinkta nepatikimai — patikrink.")
-                    if (m.source == "gps") appendLine("Nuotraukoje nebuvo GPS — paimta dabartinė vieta.")
-                    if (m.source == "none") appendLine("Vietos nustatyti nepavyko — įrašyk rankiniu būdu.")
-                    if (prefs.userToken == null && prefs.reporterEmail == null)
-                        appendLine("Nenurodytas nei žetonas, nei el. paštas — atsakymo negausi.")
-                }.trim().ifBlank { null }
-            }.onFailure { error = it.message }
-            loading = false
-        }
-
-        // ---- automatinis siuntimas ----
-        LaunchedEffect(loading, autoCancelled) {
-            if (loading || autoCancelled || AUTO_SEND_SECONDS <= 0) return@LaunchedEffect
-            if (error != null || warning != null) return@LaunchedEffect // įspėjus – tik rankiniu būdu
-            if (meta?.lat == null) return@LaunchedEffect // nėra vietos – tik rankiniu būdu
-            while (countdown > 0) { delay(1000); countdown-- }
-            sendResolved(
-                typeId, meta?.lat, meta?.lng, meta?.address ?: "",
-                description, photoBase64, meta?.takenAt,
-                setSending = { sending = it },
-                onError = { errorText = it }
-            )
-        }
-
-        Column(
-            Modifier.padding(20.dp).verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
-            AsyncImage(
-                model = photoUri, contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxWidth().height(170.dp)
-            )
-
-            when {
-                loading -> Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Text("Analizuojama…")
-                }
-
-                error != null -> Text("Klaida: $error", color = MaterialTheme.colorScheme.error)
-
-                else -> {
-                    Text(
-                        meta?.address ?: "Vieta nenustatyta",
-                        style = MaterialTheme.typography.titleMedium
-                    )
-
-                    warning?.let {
-                        Surface(color = MaterialTheme.colorScheme.errorContainer) {
-                            Text(it, Modifier.padding(12.dp))
-                        }
-                    }
-
-                    val effLat = meta?.lat ?: manualLat
-                    val effLng = meta?.lng ?: manualLng
-
-                    // Rankiniu būdu rasta vieta - aiškus patvirtinimas
-                    if (meta?.lat == null && manualLat != null) {
-                        Surface(color = MaterialTheme.colorScheme.primaryContainer) {
-                            Text(
-                                "Vieta nustatyta: $addressQuery",
-                                Modifier.padding(12.dp)
+                        for (j in 0 until types.length()) {
+                            val t = types.getJSONObject(j)
+                            val fields = t.optJSONArray("additionalFields")
+                            val hasRequired = (0 until (fields?.length() ?: 0)).any {
+                                fields!!.getJSONObject(it).optBoolean("required")
+                            }
+                            add(
+                                ProblemType(
+                                    id = t.getInt("id"),
+                                    name = t.optString("name"),
+                                    category = catName,
+                                    onlyRegistered = t.optInt("onlyRegister") == 1,
+                                    needsExtraFields = hasRequired,
+                                    redirectUrl = t.optString("redirectUrl").ifBlank { null },
+                                    seasonal = t.optInt("seasonal") == 1,
+                                )
                             )
                         }
                     }
+                }
+            }
+        }
 
-                    // Jei vietos nera - rodom zemelapi (pagrindinis budas) + adreso paieska
-                    if (effLat == null) {
-                        Text(
-                            "Vieta nenustatyta. Bakstelėk žemėlapyje, kur stovi objektas:",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        MapPicker(
-                            initial = null,
-                            onPick = { la, ln ->
-                                manualLat = la; manualLng = ln
-                                // Koordinates -> adresas, kad pranešime būtų gatvė, ne skaičiai
-                                lifecycleScope.launch {
-                                    val addr = PhotoMetaReader.reverseGeocode(
-                                        this@ShareActivity, la, ln
-                                    )
-                                    addressQuery = addr ?: "%.5f, %.5f".format(la, ln)
-                                }
-                            }
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text("arba įrašyk adresą:", style = MaterialTheme.typography.bodySmall)
-                        Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
-                            Column(Modifier.padding(12.dp)) {
-                                Spacer(Modifier.height(4.dp))
-                                OutlinedTextField(
-                                    value = addressQuery,
-                                    onValueChange = { addressQuery = it },
-                                    label = { Text("Pvz. Gedimino pr. 1") },
-                                    singleLine = true,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Spacer(Modifier.height(8.dp))
-                                Button(
-                                    enabled = !geocoding && addressQuery.isNotBlank(),
-                                    onClick = {
-                                        geocoding = true
-                                        lifecycleScope.launch {
-                                            val hit = PhotoMetaReader.forwardGeocode(
-                                                this@ShareActivity, addressQuery
-                                            )
-                                            if (hit != null) {
-                                                manualLat = hit.first
-                                                manualLng = hit.second
-                                                addressQuery = hit.third
-                                            } else {
-                                                Toast.makeText(
-                                                    this@ShareActivity,
-                                                    "Adresas nerastas, patikslink",
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
-                                            }
-                                            geocoding = false
-                                        }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) { Text(if (geocoding) "Ieškoma…" else "Rasti vietą") }
-                            }
+    /** Tik tie tipai, kuriuos ši programėlė realiai gali pateikti. */
+    suspend fun submittableTypes(cityId: Int = VILNIUS) =
+        problemTypes(cityId).filter { it.submittable(userToken != null) }
+
+    // ---------- Miestas ----------
+
+    /** Miesto nustatymai: ar leidžiamas anoniminis teikimas, ar rodomas pranešimas. */
+    suspend fun city(cityId: Int = VILNIUS): JSONObject = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url("${BASE}city/$cityId").get().build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("city ${r.code}: $raw")
+            JSONObject(raw).optJSONObject("data") ?: JSONObject(raw)
+        }
+    }
+
+    // ---------- Žetonas ----------
+
+    /** GET token/check?user_id= — grąžina galiojimo pabaigą arba meta klaidą. */
+    suspend fun tokenCheck(userId: Int): String = withContext(Dispatchers.IO) {
+        val req = Request.Builder()
+            .url("${BASE}token/check?user_id=$userId")
+            .addHeader("user_token", userToken ?: error("Žetonas neįvestas"))
+            .get().build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("token/check ${r.code}: $raw")
+            raw
+        }
+    }
+
+    /** PATCH user/synchronize — priskiria anoniminius pranešimus paskyrai. */
+    suspend fun synchronize(userId: Int, serial: String) = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("user_id", userId)
+            .put("serial_number", serial)
+        val req = Request.Builder()
+            .url("${BASE}user/synchronize")
+            .addHeader("Content-Type", "application/json")
+            .addHeader("user_token", userToken ?: error("Žetonas neįvestas"))
+            .patch(body.toString().toRequestBody(JSON))
+            .build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("user/synchronize ${r.code}: $raw")
+        }
+    }
+
+    // ---------- Pateikimas ----------
+
+    /**
+     * POST /problems/register — viena užklausa, nuotraukos base64 pavidalu.
+     *
+     * Privaloma pagal specifikaciją: city_id, type, latitude, longitude,
+     * address, violation_date_time, description.
+     *
+     * @param photosBase64 be "data:image/jpeg;base64," priešdėlio
+     */
+    suspend fun register(
+        typeId: Int,
+        description: String,
+        address: String,
+        latitude: Double,
+        longitude: Double,
+        photosBase64: List<String> = emptyList(),
+        cityId: Int = VILNIUS,
+        violationDateTime: Date = Date(),
+        carPlateNo: String? = null,
+        reporterName: String? = null,
+        reporterEmail: String? = null,
+        reporterPhone: String? = null,
+        reporterAddress: String? = null,
+    ): String = withContext(Dispatchers.IO) {
+
+        val body = JSONObject().apply {
+            put("city_id", cityId)
+            put("type", typeId)
+            put("latitude", latitude)
+            put("longitude", longitude)
+            put("address", address)
+            put("description", description)
+            put(
+                "violation_date_time",
+                SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(violationDateTime)
+            )
+            carPlateNo?.let { put("car_plate_no", it) }
+            reporterName?.let { put("reporter_name", it) }
+            reporterEmail?.let { put("reporter_email", it) }
+            reporterPhone?.let { put("reporter_phone", it) }
+            reporterAddress?.let { put("reporter_address", it) }
+            serialNumber?.let { put("serial_number", it) }
+            if (photosBase64.isNotEmpty()) {
+                put("files", JSONArray().apply { photosBase64.forEach { put(it) } })
+            }
+        }
+
+        val req = Request.Builder()
+            .url("${BASE}problems/register")
+            .addHeader("Content-Type", "application/json")
+            .apply { userToken?.let { addHeader("user_token", it) } }
+            .post(body.toString().toRequestBody(JSON))
+            .build()
+
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) {
+                // 422 atsakyme būna message + errors: { laukas: ["..."] }
+                val detail = runCatching {
+                    val o = JSONObject(raw)
+                    val msg = o.optString("message")
+                    val errs = o.optJSONObject("errors")
+                    buildString {
+                        append(msg)
+                        errs?.keys()?.forEach { k ->
+                            append("\n• ").append(k).append(": ")
+                            append(errs.optJSONArray(k)?.join(", ")?.replace("\"", "") ?: "")
                         }
                     }
-
-                    CategoryPicker(types, typeId) { typeId = it }
-
-                    OutlinedTextField(
-                        value = description,
-                        onValueChange = { description = it },
-                        label = { Text("Aprašymas") },
-                        minLines = 4,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    Button(
-                        onClick = {
-                            autoCancelled = true
-                            showConfirm = true
-                        },
-                        enabled = !sending && typeId != null && effLat != null,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            when {
-                                sending -> "Siunčiama…"
-                                countdown > 0 -> "Siųsti ($countdown)"
-                                else -> "Siųsti"
-                            }
-                        )
-                    }
-
-                    TextButton(
-                        onClick = { autoCancelled = true; finish() },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("Atšaukti") }
-
-                    errorText?.let { err ->
-                        AlertDialog(
-                            onDismissRequest = { errorText = null },
-                            title = { Text("Nepavyko pateikti") },
-                            text = {
-                                Column(Modifier.verticalScroll(rememberScrollState())) {
-                                    Text(err)
-                                }
-                            },
-                            confirmButton = {
-                                TextButton(onClick = { errorText = null }) { Text("Gerai") }
-                            }
-                        )
-                    }
-
-                    if (showConfirm) {
-                        val typeLabel = types.firstOrNull { it.id == typeId }?.label ?: "—"
-                        val addr = (meta?.address ?: addressQuery).ifBlank { "—" }
-                        ConfirmDialog(
-                            typeLabel = typeLabel,
-                            address = addr,
-                            coords = if (effLat != null && effLng != null)
-                                "%.5f, %.5f".format(effLat, effLng) else "—",
-                            description = description,
-                            takenAt = meta?.takenAt,
-                            anonymous = prefs.userToken == null,
-                            onDismiss = { showConfirm = false },
-                            onConfirm = {
-                                showConfirm = false
-                                sendResolved(
-                                    typeId, effLat, effLng,
-                                    meta?.address ?: addressQuery,
-                                    description, photoBase64, meta?.takenAt,
-                                    setSending = { sending = it },
-                                    onError = { errorText = it }
-                                )
-                            }
-                        )
-                    }
-                }
+                }.getOrDefault(raw)
+                error("register ${r.code}: $detail")
             }
-        }
-    }
-
-    @Composable
-    private fun ConfirmDialog(
-        typeLabel: String,
-        address: String,
-        coords: String,
-        description: String,
-        takenAt: java.util.Date?,
-        anonymous: Boolean,
-        onDismiss: () -> Unit,
-        onConfirm: () -> Unit,
-    ) {
-        val dateStr = takenAt?.let {
-            java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.US).format(it)
-        } ?: "dabar"
-
-        AlertDialog(
-            onDismissRequest = onDismiss,
-            title = { Text("Patvirtink pranešimą") },
-            text = {
-                Column(
-                    Modifier.verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    SummaryRow("Kategorija", typeLabel)
-                    SummaryRow("Adresas", address)
-                    SummaryRow("Koordinatės", coords)
-                    SummaryRow("Data / laikas", dateStr)
-                    SummaryRow("Aprašymas", description)
-                    SummaryRow(
-                        "Teikiama",
-                        if (anonymous) "anonimiškai (atsakymo negausi)"
-                        else "iš tavo paskyros"
-                    )
-                    Text(
-                        "Pateiktas pranešimas keliauja į savivaldybės sistemą ir " +
-                            "tampa oficialiu dokumentu.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = onConfirm) { Text("Pateikti") }
-            },
-            dismissButton = {
-                TextButton(onClick = onDismiss) { Text("Grįžti taisyti") }
-            },
-        )
-    }
-
-    @Composable
-    private fun SummaryRow(label: String, value: String) {
-        Column {
-            Text(
-                label,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(value, style = MaterialTheme.typography.bodyMedium)
-        }
-    }
-
-    @OptIn(ExperimentalMaterial3Api::class)
-    @Composable
-    private fun CategoryPicker(
-        types: List<TvarkauApi.ProblemType>,
-        selected: Int?,
-        onSelect: (Int) -> Unit,
-    ) {
-        var open by remember { mutableStateOf(false) }
-        val label = types.firstOrNull { it.id == selected }?.label ?: "Pasirink kategoriją"
-
-        ExposedDropdownMenuBox(expanded = open, onExpandedChange = { open = !open }) {
-            OutlinedTextField(
-                value = label, onValueChange = {}, readOnly = true,
-                label = { Text("Kategorija") },
-                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(open) },
-                modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth()
-            )
-            ExposedDropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-                types.forEach { t ->
-                    DropdownMenuItem(
-                        text = { Text(t.label) },
-                        onClick = { onSelect(t.id); open = false }
-                    )
-                }
-            }
-        }
-    }
-
-    private fun sendResolved(
-        typeId: Int?,
-        latitude: Double?,
-        longitude: Double?,
-        address: String,
-        description: String,
-        photoBase64: String?,
-        takenAt: java.util.Date?,
-        setSending: (Boolean) -> Unit,
-        onError: (String) -> Unit,
-    ) {
-        val id = typeId ?: return
-        val lat = latitude ?: return
-        val lng = longitude ?: return
-        val photo = photoBase64 ?: return
-
-        setSending(true)
-        lifecycleScope.launch {
-            runCatching {
-                TvarkauApi.register(
-                    typeId = id,
-                    description = description,
-                    address = address,
-                    latitude = lat,
-                    longitude = lng,
-                    photosBase64 = listOf(photo),
-                    violationDateTime = takenAt ?: java.util.Date(),
-                    // Prisijungus serveris duomenis ima iš paskyros — nesiunčiam
-                    reporterName = if (prefs.userToken == null) prefs.reporterName else null,
-                    reporterEmail = if (prefs.userToken == null) prefs.reporterEmail else null,
-                    reporterPhone = if (prefs.userToken == null) prefs.reporterPhone else null,
-                )
-            }.onSuccess { msg ->
-                Toast.makeText(this@ShareActivity, msg, Toast.LENGTH_LONG).show()
-                finish()
-            }.onFailure {
-                setSending(false)
-                onError(
-                    when (it) {
-                        is java.net.SocketTimeoutException ->
-                            "Serveris neatsako. Patikrink ryšį ir bandyk dar kartą."
-                        is java.io.IOException -> "Nėra interneto ryšio."
-                        else -> it.message ?: "Nežinoma klaida"
-                    }
-                )
-            }
+            JSONObject(raw).optJSONObject("data")?.optString("successMessage")
+                ?.ifBlank { null } ?: "Pranešimas pateiktas"
         }
     }
 }
