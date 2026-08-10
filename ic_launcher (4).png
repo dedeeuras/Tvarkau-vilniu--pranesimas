@@ -1,0 +1,226 @@
+package lt.pilietis.greitaspranesimas
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Parašyta pagal oficialią OpenAPI 2.0.0 specifikaciją:
+ * https://api-tvarkau.vilnius.lt/docs-v2
+ */
+object TvarkauApi {
+
+    private const val BASE = "https://api-tvarkau.vilnius.lt/api/v2/"
+    const val VILNIUS = 1
+
+    private val JSON = "application/json".toMediaType()
+    private val http = OkHttpClient.Builder()
+        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)  // nuotraukos įkėlimas
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
+
+    /** Antraštė user_token. null = teikiama anonimiškai. */
+    var userToken: String? = null
+
+    /**
+     * Anoniminio pranešėjo identifikatorius. Turi būti PASTOVUS šiam įrenginiui —
+     * pagal jį vėliau galima rasti savo pranešimus (`GET /problems?serial_number=`)
+     * arba juos susieti su paskyra (`PATCH /user/synchronize`).
+     * Svetainė generuoja naują kaskart, todėl ten ta galimybė prarandama.
+     */
+    var serialNumber: String? = null
+
+    // ---------- Kategorijos ----------
+
+    data class ProblemType(
+        val id: Int,
+        val name: String,
+        val category: String,
+        val onlyRegistered: Boolean,  // onlyRegister=1 -> anonimiškai negalima
+        val needsExtraFields: Boolean, // additionalFields su required
+        val redirectUrl: String?,      // jei yra - teikiama ne čia, o kitoje svetainėje
+        val seasonal: Boolean,
+    ) {
+        val label get() = "$category → $name"
+
+        /** Ar šį tipą galima pateikti šia programėle dabartinėje būsenoje. */
+        fun submittable(hasToken: Boolean) =
+            redirectUrl.isNullOrBlank() && !needsExtraFields && (hasToken || !onlyRegistered)
+    }
+
+    /** Dviejų lygių atsakymas suplokštinamas į vieną sąrašą. */
+    suspend fun problemTypes(cityId: Int = VILNIUS): List<ProblemType> =
+        withContext(Dispatchers.IO) {
+            val req = Request.Builder()
+                .url("${BASE}categories/problem-types?cityId=$cityId")
+                .get().build()
+
+            http.newCall(req).execute().use { r ->
+                val raw = r.body?.string().orEmpty()
+                if (!r.isSuccessful) error("problem-types ${r.code}: $raw")
+                val cats = JSONObject(raw).getJSONArray("data")
+
+                buildList {
+                    for (i in 0 until cats.length()) {
+                        val cat = cats.getJSONObject(i)
+                        val catName = cat.optString("name")
+                        val types = cat.optJSONArray("problemTypes") ?: continue
+
+                        for (j in 0 until types.length()) {
+                            val t = types.getJSONObject(j)
+                            val fields = t.optJSONArray("additionalFields")
+                            val hasRequired = (0 until (fields?.length() ?: 0)).any {
+                                fields!!.getJSONObject(it).optBoolean("required")
+                            }
+                            add(
+                                ProblemType(
+                                    id = t.getInt("id"),
+                                    name = t.optString("name"),
+                                    category = catName,
+                                    onlyRegistered = t.optInt("onlyRegister") == 1,
+                                    needsExtraFields = hasRequired,
+                                    redirectUrl = t.optString("redirectUrl").ifBlank { null },
+                                    seasonal = t.optInt("seasonal") == 1,
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+    /** Tik tie tipai, kuriuos ši programėlė realiai gali pateikti. */
+    suspend fun submittableTypes(cityId: Int = VILNIUS) =
+        problemTypes(cityId).filter { it.submittable(userToken != null) }
+
+    // ---------- Miestas ----------
+
+    /** Miesto nustatymai: ar leidžiamas anoniminis teikimas, ar rodomas pranešimas. */
+    suspend fun city(cityId: Int = VILNIUS): JSONObject = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url("${BASE}city/$cityId").get().build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("city ${r.code}: $raw")
+            JSONObject(raw).optJSONObject("data") ?: JSONObject(raw)
+        }
+    }
+
+    // ---------- Žetonas ----------
+
+    /** GET token/check?user_id= — grąžina galiojimo pabaigą arba meta klaidą. */
+    suspend fun tokenCheck(userId: Int): String = withContext(Dispatchers.IO) {
+        val req = Request.Builder()
+            .url("${BASE}token/check?user_id=$userId")
+            .addHeader("user_token", userToken ?: error("Žetonas neįvestas"))
+            .get().build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("token/check ${r.code}: $raw")
+            raw
+        }
+    }
+
+    /** PATCH user/synchronize — priskiria anoniminius pranešimus paskyrai. */
+    suspend fun synchronize(userId: Int, serial: String) = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("user_id", userId)
+            .put("serial_number", serial)
+        val req = Request.Builder()
+            .url("${BASE}user/synchronize")
+            .addHeader("Content-Type", "application/json")
+            .addHeader("user_token", userToken ?: error("Žetonas neįvestas"))
+            .patch(body.toString().toRequestBody(JSON))
+            .build()
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("user/synchronize ${r.code}: $raw")
+        }
+    }
+
+    // ---------- Pateikimas ----------
+
+    /**
+     * POST /problems/register — viena užklausa, nuotraukos base64 pavidalu.
+     *
+     * Privaloma pagal specifikaciją: city_id, type, latitude, longitude,
+     * address, violation_date_time, description.
+     *
+     * @param photosBase64 be "data:image/jpeg;base64," priešdėlio
+     */
+    suspend fun register(
+        typeId: Int,
+        description: String,
+        address: String,
+        latitude: Double,
+        longitude: Double,
+        photosBase64: List<String> = emptyList(),
+        cityId: Int = VILNIUS,
+        violationDateTime: Date = Date(),
+        carPlateNo: String? = null,
+        reporterName: String? = null,
+        reporterEmail: String? = null,
+        reporterPhone: String? = null,
+        reporterAddress: String? = null,
+    ): String = withContext(Dispatchers.IO) {
+
+        val body = JSONObject().apply {
+            put("city_id", cityId)
+            put("type", typeId)
+            put("latitude", latitude)
+            put("longitude", longitude)
+            put("address", address)
+            put("description", description)
+            put(
+                "violation_date_time",
+                SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(violationDateTime)
+            )
+            carPlateNo?.let { put("car_plate_no", it) }
+            reporterName?.let { put("reporter_name", it) }
+            reporterEmail?.let { put("reporter_email", it) }
+            reporterPhone?.let { put("reporter_phone", it) }
+            reporterAddress?.let { put("reporter_address", it) }
+            serialNumber?.let { put("serial_number", it) }
+            if (photosBase64.isNotEmpty()) {
+                put("files", JSONArray().apply { photosBase64.forEach { put(it) } })
+            }
+        }
+
+        val req = Request.Builder()
+            .url("${BASE}problems/register")
+            .addHeader("Content-Type", "application/json")
+            .apply { userToken?.let { addHeader("user_token", it) } }
+            .post(body.toString().toRequestBody(JSON))
+            .build()
+
+        http.newCall(req).execute().use { r ->
+            val raw = r.body?.string().orEmpty()
+            if (!r.isSuccessful) {
+                // 422 atsakyme būna message + errors: { laukas: ["..."] }
+                val detail = runCatching {
+                    val o = JSONObject(raw)
+                    val msg = o.optString("message")
+                    val errs = o.optJSONObject("errors")
+                    buildString {
+                        append(msg)
+                        errs?.keys()?.forEach { k ->
+                            append("\n• ").append(k).append(": ")
+                            append(errs.optJSONArray(k)?.join(", ")?.replace("\"", "") ?: "")
+                        }
+                    }
+                }.getOrDefault(raw)
+                error("register ${r.code}: $detail")
+            }
+            JSONObject(raw).optJSONObject("data")?.optString("successMessage")
+                ?.ifBlank { null } ?: "Pranešimas pateiktas"
+        }
+    }
+}

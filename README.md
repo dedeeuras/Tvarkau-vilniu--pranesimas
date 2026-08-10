@@ -270,7 +270,17 @@ WhatsApp), GPS blokas dažnai lieka nuotraukoje, bet jo reikšmės tampa tušči
 (`NaN`). Programėlė tokias atmeta ir griebia įrenginio GPS. Todėl geriausia
 dalintis **originalu iš Galerijos**, o ne persiųsta kopija.
 
-## 7. Kas liko nepatikrinta
+## 7. Našumas ir tinklas
+
+Nuotrauka siunčiama base64 pavidalu pačiame JSON'e, todėl prieš siuntimą ji
+sumažinama iki 900 px ir suspaudžiama, kol JPEG telpa į ~500 KB. Be to nustatyti
+tinklo timeout'ai (jungimasis 15 s, siuntimas/skaitymas po 60 s), tad jei
+serveris neatsako, programėlė nepakimba amžinai, o parodo aiškią klaidą.
+
+Jei Pixel daro labai raiškias nuotraukas ir siuntimas vis tiek lėtas —
+sumažink `maxSide` (`PhotoMeta.kt`) iki 720.
+
+## 8. Kas liko nepatikrinta
 
 Kodas parašytas pagal oficialią specifikaciją, bet realia užklausa dar
 neišbandytas. Jei `register` grąžins 422, atsakyme bus `errors` su konkrečiu

@@ -1,0 +1,126 @@
+package lt.pilietis.greitaspranesimas
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import java.util.concurrent.TimeUnit
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+
+data class Suggestion(
+    val reportTypeId: Int?,
+    val description: String,
+    val confidence: Double,
+    val reportable: Boolean,
+    val warning: String?, // pvz. "matomi valstybiniai numeriai"
+)
+
+object Vision {
+
+    private const val ENDPOINT = "https://api.anthropic.com/v1/messages"
+
+    // claude-haiku-4-5-20251001 — pigiau ir greičiau, kokybės skirtumas šiam
+    // uždaviniui nedidelis. claude-sonnet-5 — tikslesnės kategorijos.
+    private const val MODEL = "claude-sonnet-5"
+
+    private val SYSTEM = """
+        Tu esi pagalbininkas, rengiantis pranešimus Lietuvos savivaldybei apie
+        miesto infrastruktūros problemas („Tvarkau miestą" sistema).
+
+        Gauni nuotrauką, adresą ir galimų kategorijų sąrašą.
+
+        Atsakyk TIK JSON objektu, be jokio paaiškinimo ir be ``` ženklų:
+        {
+          "report_type_id": <sveikasis skaičius iš pateikto sąrašo arba null>,
+          "description": "<2-4 sakiniai lietuviškai, dalykiniu stiliumi>",
+          "confidence": <0.0-1.0>,
+          "reportable": <true, jei tai tikrai savivaldybės kompetencijos problema>,
+          "warning": "<null arba trumpas įspėjimas, jei nuotraukoje matyti
+                       valstybiniai numeriai, atpažįstami veidai ar privatūs langai>"
+        }
+
+        Aprašymo taisyklės:
+        - Faktai, ne emocijos. Be „siaubinga", „gėda", „kada pagaliau".
+        - Įvardyk, kas negerai, ir kur (naudok pateiktą adresą).
+        - Jei matai pavojų žmonėms ar eismui — pasakyk tai pirmame sakinyje.
+        - Nespėliok to, ko nesimato nuotraukoje (pvz., kiek laiko taip yra).
+        - Jei nuotraukoje nėra jokios miesto problemos, nustatyk reportable=false.
+    """.trimIndent()
+
+    suspend fun analyze(
+        apiKey: String,
+        imageBase64: String,
+        address: String?,
+        types: List<TvarkauApi.ProblemType>,
+    ): Suggestion = withContext(Dispatchers.IO) {
+
+        val typeList = types.joinToString("\n") { "${it.id} — ${it.label}" }
+
+        val content = JSONArray().apply {
+            put(JSONObject().apply {
+                put("type", "image")
+                put("source", JSONObject().apply {
+                    put("type", "base64")
+                    put("media_type", "image/jpeg")
+                    put("data", imageBase64)
+                })
+            })
+            put(JSONObject().apply {
+                put("type", "text")
+                put("text", buildString {
+                    append("Adresas: ").append(address ?: "nežinomas").append("\n\n")
+                    append("Galimos kategorijos:\n").append(typeList)
+                })
+            })
+        }
+
+        val body = JSONObject().apply {
+            put("model", MODEL)
+            put("max_tokens", 700)
+            put("system", SYSTEM)
+            put("messages", JSONArray().put(JSONObject().apply {
+                put("role", "user")
+                put("content", content)
+            }))
+        }
+
+        val request = Request.Builder()
+            .url(ENDPOINT)
+            .addHeader("x-api-key", apiKey)
+            .addHeader("anthropic-version", "2023-06-01")
+            .addHeader("content-type", "application/json")
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+
+        val client = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+        client.newCall(request).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) error("Claude API ${resp.code}: $raw")
+
+            val text = JSONObject(raw).getJSONArray("content")
+                .let { arr -> (0 until arr.length()).map { arr.getJSONObject(it) } }
+                .filter { it.optString("type") == "text" }
+                .joinToString("") { it.optString("text") }
+                .replace("```json", "").replace("```", "")
+                .trim()
+
+            val json = JSONObject(text)
+            Suggestion(
+                reportTypeId = json.opt("report_type_id")?.takeIf { it != JSONObject.NULL }
+                    ?.toString()?.toIntOrNull(),
+                description = json.optString("description"),
+                confidence = json.optDouble("confidence", 0.0),
+                reportable = json.optBoolean("reportable", true),
+                warning = json.opt("warning")
+                    ?.takeIf { it != JSONObject.NULL }?.toString()?.ifBlank { null },
+            )
+        }
+    }
+}
